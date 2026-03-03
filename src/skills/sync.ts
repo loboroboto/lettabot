@@ -5,7 +5,7 @@
 import { existsSync, readdirSync, cpSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import * as p from '@clack/prompts';
-import { PROJECT_SKILLS_DIR, GLOBAL_SKILLS_DIR, SKILLS_SH_DIR, parseSkillFile } from './loader.js';
+import { PROJECT_SKILLS_DIR, BUNDLED_SKILLS_DIR, GLOBAL_SKILLS_DIR, SKILLS_SH_DIR, parseSkillFile } from './loader.js';
 
 const HOME = process.env.HOME || process.env.USERPROFILE || '';
 const WORKING_DIR = process.env.WORKING_DIR || '/tmp/lettabot';
@@ -68,10 +68,12 @@ function discoverSkills(): SkillInfo[] {
     }
   };
   
-  // Discover from all sources (order matters - first source wins for duplicates)
+  // Discover from all sources (order matters - first source wins for duplicates).
+  // Priority matches the loader hierarchy: project (.skills/) > bundled (skills/) > external.
+  addFromDir(PROJECT_SKILLS_DIR, 'builtin'); // .skills/ project overrides
+  addFromDir(BUNDLED_SKILLS_DIR, 'builtin'); // skills/ bundled with repo
   addFromDir(CLAWDHUB_DIR, 'clawdhub');
   addFromDir(VERCEL_DIR, 'vercel');
-  addFromDir(PROJECT_SKILLS_DIR, 'builtin');
   
   return skills.sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -217,4 +219,33 @@ export async function runSkillsSync(): Promise<void> {
   
   p.log.info(`Skills directory: ${TARGET_DIR}`);
   p.outro(`✨ Added ${toAdd.length}, removed ${toRemove.length} skill(s)`);
+}
+
+/**
+ * Non-interactively enable a single skill by name.
+ * Searches BUNDLED_SKILLS_DIR, then GLOBAL_SKILLS_DIR, then SKILLS_SH_DIR.
+ */
+export function enableSkill(name: string): void {
+  // Search order: highest priority first (project local > global > bundled > skills.sh)
+  const sourceDirs = [PROJECT_SKILLS_DIR, GLOBAL_SKILLS_DIR, BUNDLED_SKILLS_DIR, SKILLS_SH_DIR];
+  
+  mkdirSync(TARGET_DIR, { recursive: true });
+  
+  const dest = join(TARGET_DIR, name);
+  if (existsSync(dest)) {
+    console.log(`Skill '${name}' is already enabled.`);
+    return;
+  }
+  
+  for (const dir of sourceDirs) {
+    const src = join(dir, name);
+    if (existsSync(src) && existsSync(join(src, 'SKILL.md'))) {
+      cpSync(src, dest, { recursive: true });
+      console.log(`Enabled skill '${name}' from ${dir}`);
+      return;
+    }
+  }
+  
+  console.error(`Skill '${name}' not found. Run 'lettabot skills status' to see available skills.`);
+  process.exit(1);
 }
