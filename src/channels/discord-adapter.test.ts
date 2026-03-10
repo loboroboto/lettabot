@@ -185,7 +185,7 @@ describe('DiscordAdapter command gating', () => {
     await client!.emit('messageCreate', message);
 
     expect(onCommand).toHaveBeenCalledTimes(1);
-    expect(onCommand).toHaveBeenCalledWith('status', 'thread-1', undefined);
+    expect(onCommand).toHaveBeenCalledWith('status', 'thread-1', undefined, true);
     expect(message.channel.send).toHaveBeenCalledWith('ok');
     await adapter.stop();
   });
@@ -222,7 +222,7 @@ describe('DiscordAdapter command gating', () => {
 
     expect(message.startThread).toHaveBeenCalledTimes(1);
     expect(onCommand).toHaveBeenCalledTimes(1);
-    expect(onCommand).toHaveBeenCalledWith('status', 'thread-created', undefined);
+    expect(onCommand).toHaveBeenCalledWith('status', 'thread-created', undefined, true);
     expect(threadSend).toHaveBeenCalledWith('ok');
     expect(message.channel.send).not.toHaveBeenCalled();
     await adapter.stop();

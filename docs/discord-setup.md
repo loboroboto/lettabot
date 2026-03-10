@@ -209,6 +209,7 @@ Behavior summary:
 - Top-level messages are ignored in `thread-only` mode.
 - Top-level @mentions create a thread and are answered in that thread when `autoCreateThreadOnMention` is enabled.
 - Thread messages inherit parent channel config. If `EZRA_CHANNEL_ID` is configured, replies in its child threads use that same config.
+- Each thread gets its own isolated conversation (message history), overriding `shared` and `per-channel` conversation modes. This prevents crosstalk between threads. Agent memory (blocks) is still shared.
 
 Required Discord permissions for auto-create:
 

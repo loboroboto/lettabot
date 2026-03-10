@@ -115,7 +115,7 @@ export class DiscordAdapter implements ChannelAdapter {
   private attachmentsMaxBytes?: number;
 
   onMessage?: (msg: InboundMessage) => Promise<void>;
-  onCommand?: (command: string, chatId?: string, args?: string) => Promise<string | null>;
+  onCommand?: (command: string, chatId?: string, args?: string, forcePerChat?: boolean) => Promise<string | null>;
 
   constructor(config: DiscordConfig) {
     this.config = {
@@ -330,9 +330,11 @@ Ask the bot owner to approve with:
               ? (message.channel as { send: (content: string) => Promise<unknown> })
               : null;
 
+          let commandForcePerChat = false;
           if (isGroup && this.config.groups) {
             const threadMode = resolveDiscordThreadMode(this.config.groups, keys);
-            if (threadMode === 'thread-only' && !isThreadMessage) {
+            commandForcePerChat = threadMode === 'thread-only';
+            if (commandForcePerChat && !isThreadMessage) {
               const shouldCreateThread =
                 wasMentioned && resolveDiscordAutoCreateThreadOnMention(this.config.groups, keys);
               if (!shouldCreateThread) {
@@ -365,7 +367,7 @@ Ask the bot owner to approve with:
           }
 
           if (this.onCommand && isManagedCommand) {
-            const result = await this.onCommand(command, commandChatId, cmdArgs);
+            const result = await this.onCommand(command, commandChatId, cmdArgs, commandForcePerChat || undefined);
             if (result) {
               if (!commandSendTarget) return;
               await commandSendTarget.send(result);
@@ -381,6 +383,7 @@ Ask the bot owner to approve with:
         let isListeningMode = false;
         let effectiveChatId = message.channel.id;
         let effectiveGroupName = groupName;
+        let isThreadOnly = false;
 
         // Group gating: config-based allowlist + mode
         if (isGroup && this.config.groups) {
@@ -414,7 +417,8 @@ Ask the bot owner to approve with:
           }
 
           const threadMode = resolveDiscordThreadMode(this.config.groups, keys);
-          if (threadMode === 'thread-only' && !isThreadMessage) {
+          isThreadOnly = threadMode === 'thread-only';
+          if (isThreadOnly && !isThreadMessage) {
             const shouldCreateThread =
               wasMentioned && resolveDiscordAutoCreateThreadOnMention(this.config.groups, keys);
             if (!shouldCreateThread) {
@@ -444,6 +448,7 @@ Ask the bot owner to approve with:
           serverId: message.guildId || undefined,
           wasMentioned,
           isListeningMode,
+          forcePerChat: isThreadOnly || undefined,
           attachments,
           formatterHints: this.getFormatterHints(),
         });
@@ -616,6 +621,7 @@ Ask the bot owner to approve with:
     }
 
     let isListeningMode = false;
+    let reactionForcePerChat = false;
     if (isGroup && this.config.groups) {
       if (!isGroupAllowed(this.config.groups, keys)) {
         log.info(`Reaction group ${channelId} not in allowlist, ignoring`);
@@ -636,6 +642,7 @@ Ask the bot owner to approve with:
       if (threadMode === 'thread-only' && !isThreadMessage) {
         return;
       }
+      reactionForcePerChat = threadMode === 'thread-only';
 
       const limits = resolveDailyLimits(this.config.groups, keys);
       const counterScope = limits.matchedKey ?? channelId;
@@ -674,6 +681,7 @@ Ask the bot owner to approve with:
       groupName,
       serverId: message.guildId || undefined,
       isListeningMode,
+      forcePerChat: reactionForcePerChat || undefined,
       reaction: {
         emoji,
         messageId: message.id,

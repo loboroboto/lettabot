@@ -373,10 +373,11 @@ export class SessionManager {
       return this.ensureSessionForKey(key, bootstrapRetried);
     }
 
-    // LRU eviction: in per-chat mode, limit concurrent sessions to avoid
-    // unbounded subprocess growth.
+    // LRU eviction: limit concurrent sessions to avoid unbounded subprocess
+    // growth. Applies in per-chat mode and when forcePerChat (e.g., Discord
+    // thread-only) creates per-thread keys in other modes.
     const maxSessions = this.config.maxSessions ?? 10;
-    if (this.config.conversationMode === 'per-chat' && this.sessions.size >= maxSessions) {
+    if (this.sessions.size >= maxSessions) {
       let oldestKey: string | null = null;
       let oldestTime = Infinity;
       for (const [k, ts] of this.sessionLastUsed) {
