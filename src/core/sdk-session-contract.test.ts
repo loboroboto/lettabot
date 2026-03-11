@@ -1100,6 +1100,81 @@ describe('SDK session contract', () => {
     expect(sentTexts).toContain('after retry');
   });
 
+  it('filters pre-foreground errors so they do not trigger false approval recovery', async () => {
+    const bot = new LettaBot({
+      workingDir: join(dataDir, 'working'),
+      allowedTools: [],
+    });
+
+    let runCall = 0;
+    (bot as any).sessionManager.runSession = vi.fn(async () => ({
+      session: { abort: vi.fn(async () => undefined) },
+      stream: async function* () {
+        if (runCall++ === 0) {
+          // Pre-foreground error is filtered by the pipeline -- it never
+          // reaches processMessage, so lastErrorDetail stays null and
+          // isApprovalConflict cannot fire.
+          yield {
+            type: 'error',
+            runId: 'run-bg',
+            message: 'CONFLICT: Cannot send a new message: waiting for approval',
+            stopReason: 'error',
+          };
+          yield { type: 'result', success: false, error: 'error', conversationId: 'conv-approval', runIds: ['run-main'] };
+          return;
+        }
+        // Retry succeeds
+        yield { type: 'assistant', content: 'after retry' };
+        yield { type: 'result', success: true, result: 'after retry', conversationId: 'conv-approval', runIds: ['run-main-2'] };
+      },
+    }));
+
+    vi.mocked(recoverOrphanedConversationApproval).mockResolvedValueOnce({
+      recovered: false,
+      details: 'No unresolved approval requests found',
+    });
+
+    const adapter = {
+      id: 'mock',
+      name: 'Mock',
+      start: vi.fn(async () => {}),
+      stop: vi.fn(async () => {}),
+      isRunning: vi.fn(() => true),
+      sendMessage: vi.fn(async (_payload: unknown) => ({ messageId: 'msg-1' })),
+      editMessage: vi.fn(async () => {}),
+      sendTypingIndicator: vi.fn(async () => {}),
+      stopTypingIndicator: vi.fn(async () => {}),
+      supportsEditing: vi.fn(() => false),
+      sendFile: vi.fn(async () => ({ messageId: 'file-1' })),
+    };
+
+    const msg = {
+      channel: 'discord',
+      chatId: 'chat-1',
+      userId: 'user-1',
+      text: 'hello',
+      timestamp: new Date(),
+    };
+
+    await (bot as any).processMessage(msg, adapter);
+
+    // The pre-foreground error is filtered, so lastErrorDetail is null.
+    // The result (success=false, nothing delivered) triggers shouldRetryForErrorResult,
+    // NOT isApprovalConflict. The retry goes through the error-result path with
+    // orphaned approval recovery, then retries and succeeds.
+    expect((bot as any).sessionManager.runSession).toHaveBeenCalledTimes(2);
+    // Approval recovery should have been attempted via the error-result path
+    expect(recoverOrphanedConversationApproval).toHaveBeenCalledWith(
+      'agent-contract-test',
+      'conv-approval',
+    );
+    const sentTexts = adapter.sendMessage.mock.calls.map((call) => {
+      const payload = call[0] as { text?: string };
+      return payload.text;
+    });
+    expect(sentTexts).toContain('after retry');
+  });
+
   it('uses agent-level recovery for default conversation alias on terminal approval conflict', async () => {
     const bot = new LettaBot({
       workingDir: join(dataDir, 'working'),
