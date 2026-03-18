@@ -29,6 +29,7 @@ Thumbs.db
 .vscode/
 .idea/
 .claude/
+*.code-workspace
 
 # Runtime files
 cron-log.jsonl
