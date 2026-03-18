@@ -21,6 +21,31 @@ function getClient(): Letta {
   });
 }
 
+async function listAgentApprovalRunIds(agentId: string, limit = 10): Promise<string[]> {
+  try {
+    const client = getClient();
+    const runsPage = await client.runs.list({
+      agent_id: agentId,
+      stop_reason: 'requires_approval',
+      limit,
+    });
+
+    const runIds: string[] = [];
+    for await (const run of runsPage) {
+      if (run.stop_reason !== 'requires_approval') continue;
+      const id = (run as { id?: unknown }).id;
+      if (typeof id === 'string' && id.length > 0) {
+        runIds.push(id);
+      }
+      if (runIds.length >= limit) break;
+    }
+    return runIds;
+  } catch (e) {
+    log.warn('Failed to list approval-blocked runs:', e instanceof Error ? e.message : e);
+    return [];
+  }
+}
+
 /**
  * Test connection to Letta server (silent, no error logging)
  */
@@ -33,6 +58,88 @@ export async function testConnection(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Recover stuck approvals at the agent level without requiring a concrete
+ * conversation ID. This is the fallback for default/alias conversations.
+ */
+export async function recoverPendingApprovalsForAgent(
+  agentId: string,
+  reason = 'Session was interrupted - retrying request'
+): Promise<{ recovered: boolean; details: string }> {
+  try {
+    const pending = await getPendingApprovals(agentId);
+    if (pending.length === 0) {
+      // Some servers report approval conflicts while omitting pending_approval
+      // details/tool_call IDs. In that case, cancel approval-blocked runs directly.
+      const approvalRunIds = await listAgentApprovalRunIds(agentId);
+      if (approvalRunIds.length === 0) {
+        return { recovered: false, details: 'No pending approvals found on agent' };
+      }
+      const cancelled = await cancelRuns(agentId, approvalRunIds);
+      if (!cancelled) {
+        return {
+          recovered: false,
+          details: `Found ${approvalRunIds.length} approval-blocked run(s) but failed to cancel`,
+        };
+      }
+      return {
+        recovered: true,
+        details: `Cancelled ${approvalRunIds.length} approval-blocked run(s) without tool-call details`,
+      };
+    }
+
+    // Deduplicate by tool_call_id defensively (getPendingApprovals should
+    // already dedup, but this guards against any upstream regression).
+    const rejectedIds = new Set<string>();
+    let rejectedCount = 0;
+    for (const approval of pending) {
+      if (rejectedIds.has(approval.toolCallId)) continue;
+      rejectedIds.add(approval.toolCallId);
+      const ok = await rejectApproval(agentId, {
+        toolCallId: approval.toolCallId,
+        reason,
+      });
+      if (ok) rejectedCount += 1;
+    }
+
+    const runIds = [...new Set(
+      pending
+        .map(a => a.runId)
+        .filter((id): id is string => !!id && id !== 'unknown')
+    )];
+    if (runIds.length > 0) {
+      await cancelRuns(agentId, runIds);
+    }
+
+    if (rejectedCount === 0) {
+      return { recovered: false, details: 'Failed to reject pending approvals' };
+    }
+
+    return {
+      recovered: true,
+      details: `Rejected ${rejectedCount} pending approval(s)${runIds.length > 0 ? ` and cancelled ${runIds.length} run(s)` : ''}`,
+    };
+  } catch (e) {
+    return {
+      recovered: false,
+      details: `Agent-level approval recovery failed: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+}
+
+/**
+ * Returns true when a conversation id refers to a concrete conversation record
+ * that can be queried for messages/runs.
+ */
+export function isRecoverableConversationId(conversationId?: string | null): conversationId is string {
+  if (typeof conversationId !== 'string') return false;
+  const value = conversationId.trim();
+  if (!value) return false;
+  // SDK/API aliases are not materialized conversation IDs.
+  if (value === 'default' || value === 'shared') return false;
+  return true;
 }
 
 // Re-export types that callers use
@@ -274,48 +381,51 @@ export async function getPendingApprovals(
       if ('pending_approval' in agentState) {
         const pending = agentState.pending_approval;
         if (!pending) {
-          log.info('No pending approvals on agent');
-          return [];
-        }
-        log.info(`Found pending approval: ${pending.id}, run_id=${pending.run_id}`);
-        
-        // Extract tool calls - handle both Array<ToolCall> and ToolCallDelta formats
-        const rawToolCalls = pending.tool_calls;
-        const toolCallsList: Array<{ tool_call_id: string; name: string }> = [];
-        
-        if (Array.isArray(rawToolCalls)) {
-          for (const tc of rawToolCalls) {
-            if (tc && 'tool_call_id' in tc && tc.tool_call_id) {
+          log.info('No pending approvals on agent; falling back to run scan');
+        } else {
+          log.info(`Found pending approval: ${pending.id}, run_id=${pending.run_id}`);
+
+          // Extract tool calls - handle both Array<ToolCall> and ToolCallDelta formats
+          const rawToolCalls = pending.tool_calls;
+          const toolCallsList: Array<{ tool_call_id: string; name: string }> = [];
+
+          if (Array.isArray(rawToolCalls)) {
+            for (const tc of rawToolCalls) {
+              if (tc && 'tool_call_id' in tc && tc.tool_call_id) {
+                toolCallsList.push({ tool_call_id: tc.tool_call_id, name: tc.name || 'unknown' });
+              }
+            }
+          } else if (rawToolCalls && typeof rawToolCalls === 'object' && 'tool_call_id' in rawToolCalls && rawToolCalls.tool_call_id) {
+            // ToolCallDelta case
+            toolCallsList.push({ tool_call_id: rawToolCalls.tool_call_id, name: rawToolCalls.name || 'unknown' });
+          }
+
+          // Fallback to deprecated singular tool_call field
+          if (toolCallsList.length === 0 && pending.tool_call) {
+            const tc = pending.tool_call;
+            if ('tool_call_id' in tc && tc.tool_call_id) {
               toolCallsList.push({ tool_call_id: tc.tool_call_id, name: tc.name || 'unknown' });
             }
           }
-        } else if (rawToolCalls && typeof rawToolCalls === 'object' && 'tool_call_id' in rawToolCalls && rawToolCalls.tool_call_id) {
-          // ToolCallDelta case
-          toolCallsList.push({ tool_call_id: rawToolCalls.tool_call_id, name: rawToolCalls.name || 'unknown' });
-        }
-        
-        // Fallback to deprecated singular tool_call field
-        if (toolCallsList.length === 0 && pending.tool_call) {
-          const tc = pending.tool_call;
-          if ('tool_call_id' in tc && tc.tool_call_id) {
-            toolCallsList.push({ tool_call_id: tc.tool_call_id, name: tc.name || 'unknown' });
+
+          const seen = new Set<string>();
+          const approvals: PendingApproval[] = [];
+          for (const tc of toolCallsList) {
+            if (seen.has(tc.tool_call_id)) continue;
+            seen.add(tc.tool_call_id);
+            approvals.push({
+              runId: pending.run_id || 'unknown',
+              toolCallId: tc.tool_call_id,
+              toolName: tc.name || 'unknown',
+              messageId: pending.id,
+            });
           }
+          if (approvals.length > 0) {
+            log.info(`Extracted ${approvals.length} pending approval(s): ${approvals.map(a => a.toolName).join(', ')}`);
+            return approvals;
+          }
+          log.warn('Agent pending_approval had no tool_call_ids; falling back to run scan');
         }
-        
-        const seen = new Set<string>();
-        const approvals: PendingApproval[] = [];
-        for (const tc of toolCallsList) {
-          if (seen.has(tc.tool_call_id)) continue;
-          seen.add(tc.tool_call_id);
-          approvals.push({
-            runId: pending.run_id || 'unknown',
-            toolCallId: tc.tool_call_id,
-            toolName: tc.name || 'unknown',
-            messageId: pending.id,
-          });
-        }
-        log.info(`Extracted ${approvals.length} pending approval(s): ${approvals.map(a => a.toolName).join(', ')}`);
-        return approvals;
       }
     } catch (e) {
       log.warn('Failed to retrieve agent pending_approval, falling back to run scan:', e);
@@ -328,70 +438,73 @@ export async function getPendingApprovals(
       stop_reason: 'requires_approval',
       limit: 10,
     });
-    
-    const pendingApprovals: PendingApproval[] = [];
-    
+
+    // Collect qualifying run IDs (avoid re-fetching messages per run)
+    const qualifyingRunIds: string[] = [];
     for await (const run of runsPage) {
       if (run.status === 'running' || run.stop_reason === 'requires_approval') {
-        // Get recent messages to find approval_request_message
-        const messagesPage = await client.agents.messages.list(agentId, {
-          conversation_id: conversationId,
-          limit: 100,
-        });
-        
-        const messages: Array<{ message_type?: string }> = [];
-        for await (const msg of messagesPage) {
-          messages.push(msg as { message_type?: string });
-        }
-        
-        const resolvedToolCalls = new Set<string>();
-        for (const msg of messages) {
-          if ('message_type' in msg && msg.message_type === 'approval_response_message') {
-            const approvalMsg = msg as {
-              approvals?: Array<{ tool_call_id?: string | null }>;
-            };
-            const approvals = approvalMsg.approvals || [];
-            for (const approval of approvals) {
-              if (approval.tool_call_id) {
-                resolvedToolCalls.add(approval.tool_call_id);
-              }
-            }
-          }
-        }
-        
-        const seenToolCalls = new Set<string>();
-        for (const msg of messages) {
-          // Check for approval_request_message type
-          if ('message_type' in msg && msg.message_type === 'approval_request_message') {
-            const approvalMsg = msg as {
-              id: string;
-              tool_calls?: Array<{ tool_call_id: string; name: string }>;
-              tool_call?: { tool_call_id: string; name: string };
-              run_id?: string;
-            };
-            
-            // Extract tool call info
-            const toolCalls = approvalMsg.tool_calls || (approvalMsg.tool_call ? [approvalMsg.tool_call] : []);
-            for (const tc of toolCalls) {
-              if (resolvedToolCalls.has(tc.tool_call_id)) {
-                continue;
-              }
-              if (seenToolCalls.has(tc.tool_call_id)) {
-                continue;
-              }
-              seenToolCalls.add(tc.tool_call_id);
-              pendingApprovals.push({
-                runId: approvalMsg.run_id || run.id,
-                toolCallId: tc.tool_call_id,
-                toolName: tc.name,
-                messageId: approvalMsg.id,
-              });
-            }
+        qualifyingRunIds.push(run.id);
+      }
+    }
+
+    if (qualifyingRunIds.length === 0) {
+      return [];
+    }
+
+    // Fetch messages ONCE and scan for resolved + pending approvals
+    const messagesPage = await client.agents.messages.list(agentId, {
+      conversation_id: conversationId,
+      limit: 100,
+    });
+
+    const messages: Array<{ message_type?: string }> = [];
+    for await (const msg of messagesPage) {
+      messages.push(msg as { message_type?: string });
+    }
+
+    // Build set of already-resolved tool_call_ids
+    const resolvedToolCalls = new Set<string>();
+    for (const msg of messages) {
+      if ('message_type' in msg && msg.message_type === 'approval_response_message') {
+        const approvalMsg = msg as {
+          approvals?: Array<{ tool_call_id?: string | null }>;
+        };
+        const approvals = approvalMsg.approvals || [];
+        for (const approval of approvals) {
+          if (approval.tool_call_id) {
+            resolvedToolCalls.add(approval.tool_call_id);
           }
         }
       }
     }
-    
+
+    // Collect unresolved approval requests, deduplicating across all runs
+    const pendingApprovals: PendingApproval[] = [];
+    const seenToolCalls = new Set<string>();
+    for (const msg of messages) {
+      if ('message_type' in msg && msg.message_type === 'approval_request_message') {
+        const approvalMsg = msg as {
+          id: string;
+          tool_calls?: Array<{ tool_call_id: string; name: string }>;
+          tool_call?: { tool_call_id: string; name: string };
+          run_id?: string;
+        };
+
+        const toolCalls = approvalMsg.tool_calls || (approvalMsg.tool_call ? [approvalMsg.tool_call] : []);
+        for (const tc of toolCalls) {
+          if (resolvedToolCalls.has(tc.tool_call_id)) continue;
+          if (seenToolCalls.has(tc.tool_call_id)) continue;
+          seenToolCalls.add(tc.tool_call_id);
+          pendingApprovals.push({
+            runId: approvalMsg.run_id || qualifyingRunIds[0],
+            toolCallId: tc.tool_call_id,
+            toolName: tc.name,
+            messageId: approvalMsg.id,
+          });
+        }
+      }
+    }
+
     return pendingApprovals;
   } catch (e) {
     log.error('Failed to get pending approvals:', e);
@@ -436,6 +549,12 @@ export async function rejectApproval(
     if (err?.status === 400 && detail.includes('No tool call is currently awaiting approval')) {
       log.warn(`Approval already resolved for tool call ${approval.toolCallId}`);
       return true;
+    }
+    // Re-throw rate limit errors so callers can bail out early instead of
+    // hammering the API in a tight loop.
+    if (err?.status === 429) {
+      log.error('Failed to reject approval:', e);
+      throw e;
     }
     log.error('Failed to reject approval:', e);
     return false;
@@ -673,6 +792,13 @@ export async function recoverOrphanedConversationApproval(
   deepScan = false
 ): Promise<{ recovered: boolean; details: string }> {
   try {
+    if (!isRecoverableConversationId(conversationId)) {
+      return {
+        recovered: false,
+        details: `Conversation is not recoverable: ${conversationId || '(empty)'}`,
+      };
+    }
+
     const client = getClient();
     
     // List recent messages from the conversation to find orphaned approvals.
@@ -774,17 +900,36 @@ export async function recoverOrphanedConversationApproval(
             reason: `Auto-denied: originating run was ${status}/${stopReason}`,
           }));
           
-          try {
-            await client.conversations.messages.create(conversationId, {
-              messages: [{
-                type: 'approval',
-                approvals: approvalResponses,
-              }],
-              streaming: false,
-            });
-          } catch (batchError) {
-            log.warn(`Failed to submit approval denial batch for run ${runId} (${approvals.length} tool call(s)):`, batchError);
-            details.push(`Failed to deny ${approvals.length} approval(s) from run ${runId}`);
+          let deniedForRun = 0;
+          for (let i = 0; i < approvalResponses.length; i++) {
+            const approvalResponse = approvalResponses[i];
+            try {
+              // Letta surfaces one pending approval at a time for parallel tool calls,
+              // so submit denials sequentially instead of as a single multi-ID batch.
+              await client.conversations.messages.create(conversationId, {
+                messages: [{
+                  type: 'approval',
+                  approvals: [approvalResponse],
+                }],
+                streaming: false,
+              });
+              deniedForRun += 1;
+            } catch (approvalError) {
+              const approvalErrMsg = approvalError instanceof Error ? approvalError.message : String(approvalError);
+              log.warn(
+                `Failed to submit approval denial for run ${runId} (tool_call_id=${approvalResponse.tool_call_id}):`,
+                approvalError,
+              );
+              details.push(`Failed to deny approval ${approvalResponse.tool_call_id} from run ${runId}: ${approvalErrMsg}`);
+              continue;
+            }
+
+            if (i < approvalResponses.length - 1) {
+              await new Promise(resolve => setTimeout(resolve, 1500));
+            }
+          }
+
+          if (deniedForRun === 0) {
             continue;
           }
           
@@ -806,9 +951,9 @@ export async function recoverOrphanedConversationApproval(
             log.info(`No active runs to cancel for conversation ${conversationId}`);
           }
           
-          recoveredCount += approvals.length;
+          recoveredCount += deniedForRun;
           const suffix = cancelled ? ' (runs cancelled)' : '';
-          details.push(`Denied ${approvals.length} approval(s) from ${status} run ${runId}${suffix}`);
+          details.push(`Denied ${deniedForRun} approval(s) from ${status} run ${runId}${suffix}`);
         } else {
           details.push(`Run ${runId} is ${status}/${stopReason} - not orphaned`);
         }

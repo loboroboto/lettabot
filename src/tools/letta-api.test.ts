@@ -6,6 +6,8 @@ const mockConversationsMessagesCreate = vi.fn();
 const mockRunsRetrieve = vi.fn();
 const mockRunsList = vi.fn();
 const mockAgentsMessagesCancel = vi.fn();
+const mockAgentsRetrieve = vi.fn();
+const mockAgentsMessagesList = vi.fn();
 
 vi.mock('@letta-ai/letta-client', () => {
   return {
@@ -20,12 +22,73 @@ vi.mock('@letta-ai/letta-client', () => {
         retrieve: mockRunsRetrieve,
         list: mockRunsList,
       };
-      agents = { messages: { cancel: mockAgentsMessagesCancel } };
+      agents = {
+        retrieve: mockAgentsRetrieve,
+        messages: {
+          cancel: mockAgentsMessagesCancel,
+          list: mockAgentsMessagesList,
+        },
+      };
     },
   };
 });
 
-import { getLatestRunError, recoverOrphanedConversationApproval } from './letta-api.js';
+describe('recoverPendingApprovalsForAgent', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAgentsRetrieve.mockResolvedValue({ pending_approval: null });
+    mockAgentsMessagesList.mockReturnValue(mockPageIterator([]));
+    mockAgentsMessagesCancel.mockResolvedValue(undefined);
+  });
+
+  it('cancels approval-blocked runs when pending approval payload is unavailable', async () => {
+    // First runs.list call: getPendingApprovals run scan (no tool calls resolved)
+    mockRunsList
+      .mockReturnValueOnce(mockPageIterator([
+        { id: 'run-stuck', status: 'created', stop_reason: 'requires_approval' },
+      ]))
+      // Second runs.list call: listAgentApprovalRunIds fallback
+      .mockReturnValueOnce(mockPageIterator([
+        { id: 'run-stuck', status: 'created', stop_reason: 'requires_approval' },
+      ]));
+
+    const result = await recoverPendingApprovalsForAgent('agent-1');
+
+    expect(result.recovered).toBe(true);
+    expect(result.details).toContain('Cancelled 1 approval-blocked run(s)');
+    expect(mockAgentsMessagesCancel).toHaveBeenCalledWith('agent-1', {
+      run_ids: ['run-stuck'],
+    });
+  });
+
+  it('returns false when no pending approvals and no approval-blocked runs are found', async () => {
+    mockRunsList
+      .mockReturnValueOnce(mockPageIterator([]))
+      .mockReturnValueOnce(mockPageIterator([]));
+
+    const result = await recoverPendingApprovalsForAgent('agent-1');
+
+    expect(result.recovered).toBe(false);
+    expect(result.details).toBe('No pending approvals found on agent');
+    expect(mockAgentsMessagesCancel).not.toHaveBeenCalled();
+  });
+});
+
+import { getLatestRunError, recoverOrphanedConversationApproval, isRecoverableConversationId, recoverPendingApprovalsForAgent } from './letta-api.js';
+
+describe('isRecoverableConversationId', () => {
+  it('returns false for aliases and empty values', () => {
+    expect(isRecoverableConversationId(undefined)).toBe(false);
+    expect(isRecoverableConversationId(null)).toBe(false);
+    expect(isRecoverableConversationId('')).toBe(false);
+    expect(isRecoverableConversationId('default')).toBe(false);
+    expect(isRecoverableConversationId('shared')).toBe(false);
+  });
+
+  it('returns true for materialized conversation ids', () => {
+    expect(isRecoverableConversationId('conv-123')).toBe(true);
+  });
+});
 
 // Helper to create a mock async iterable from an array (Letta client returns paginated iterators)
 function mockPageIterator<T>(items: T[]) {
@@ -40,6 +103,8 @@ describe('recoverOrphanedConversationApproval', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockRunsList.mockReturnValue(mockPageIterator([]));
+    mockAgentsRetrieve.mockResolvedValue({ pending_approval: null });
+    mockAgentsMessagesList.mockReturnValue(mockPageIterator([]));
     vi.useFakeTimers();
   });
 
@@ -54,6 +119,14 @@ describe('recoverOrphanedConversationApproval', () => {
 
     expect(result.recovered).toBe(false);
     expect(result.details).toBe('No messages in conversation');
+  });
+
+  it('skips non-recoverable conversation ids like default', async () => {
+    const result = await recoverOrphanedConversationApproval('agent-1', 'default');
+
+    expect(result.recovered).toBe(false);
+    expect(result.details).toContain('Conversation is not recoverable: default');
+    expect(mockConversationsMessagesList).not.toHaveBeenCalled();
   });
 
   it('returns false when no unresolved approval requests', async () => {
@@ -209,8 +282,42 @@ describe('recoverOrphanedConversationApproval', () => {
     expect(approvals[0].tool_call_id).toBe('tc-dup');
   });
 
-  it('continues recovery if batch denial API call fails', async () => {
-    // Two runs with approvals -- first batch fails, second should still succeed
+  it('recovers remaining approvals by submitting denials sequentially', async () => {
+    // Parallel tool calls can fail when denied as one batch. Verify we keep
+    // progressing by submitting one tool_call_id per request.
+    mockConversationsMessagesList.mockReturnValue(mockPageIterator([
+      {
+        message_type: 'approval_request_message',
+        tool_calls: [
+          { tool_call_id: 'tc-a', name: 'Bash' },
+          { tool_call_id: 'tc-b', name: 'Read' },
+          { tool_call_id: 'tc-c', name: 'Grep' },
+        ],
+        run_id: 'run-parallel',
+        id: 'msg-parallel',
+      },
+    ]));
+    mockRunsRetrieve.mockResolvedValue({ status: 'failed', stop_reason: 'error' });
+    mockConversationsMessagesCreate
+      .mockRejectedValueOnce(new Error("Invalid tool call IDs. Expected '['tc-b']', but received '['tc-a']'"))
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({});
+    mockRunsList.mockReturnValue(mockPageIterator([]));
+
+    const resultPromise = recoverOrphanedConversationApproval('agent-1', 'conv-1');
+    await vi.advanceTimersByTimeAsync(10000);
+    const result = await resultPromise;
+
+    expect(result.recovered).toBe(true);
+    expect(result.details).toContain('Failed to deny approval tc-a from run run-parallel');
+    expect(result.details).toContain('Denied 2 approval(s) from failed run run-parallel');
+    expect(mockConversationsMessagesCreate).toHaveBeenCalledTimes(3);
+    expect(mockConversationsMessagesCreate.mock.calls.map((call) => call[1].messages[0].approvals[0].tool_call_id))
+      .toEqual(['tc-a', 'tc-b', 'tc-c']);
+  });
+
+  it('continues recovery if approval denial API call fails for one run', async () => {
+    // Two runs with approvals -- first denial fails, second should still succeed
     mockConversationsMessagesList.mockReturnValue(mockPageIterator([
       {
         message_type: 'approval_request_message',

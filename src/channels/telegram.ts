@@ -22,10 +22,42 @@ import { basename } from 'node:path';
 import { buildAttachmentPath, downloadToFile } from './attachments.js';
 import { applyTelegramGroupGating } from './telegram-group-gating.js';
 import { resolveDailyLimits, checkDailyLimit, type GroupModeConfig } from './group-mode.js';
+import { HELP_TEXT } from '../core/commands.js';
 
 import { createLogger } from '../logger.js';
 
 const log = createLogger('Telegram');
+const KNOWN_TELEGRAM_COMMANDS = new Set([
+  'status',
+  'model',
+  'heartbeat',
+  'reset',
+  'cancel',
+  'setconv',
+  'help',
+  'start',
+]);
+
+function getTelegramErrorReason(err: unknown): string {
+  if (err && typeof err === 'object') {
+    const maybeError = err as { description?: string; message?: string };
+    if (typeof maybeError.description === 'string' && maybeError.description.trim().length > 0) {
+      return maybeError.description;
+    }
+    if (typeof maybeError.message === 'string' && maybeError.message.trim().length > 0) {
+      return maybeError.message;
+    }
+  }
+  return String(err);
+}
+
+function shouldFallbackToAudio(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const description = (err as { description?: string }).description;
+  if (typeof description !== 'string') return false;
+  return description.includes('VOICE_MESSAGES_FORBIDDEN');
+}
+
 export interface TelegramConfig {
   token: string;
   dmPolicy?: DmPolicy;           // 'pairing' (default), 'allowlist', or 'open'
@@ -219,21 +251,30 @@ export class TelegramAdapter implements ChannelAdapter {
     
     // Handle /start and /help
     this.bot.command(['start', 'help'], async (ctx) => {
-      await ctx.reply(
-        "*LettaBot* - AI assistant with persistent memory\n\n" +
-        "*Commands:*\n" +
-        "/status - Show current status\n" +
-        "/help - Show this message\n\n" +
-        "Just send me a message to get started!",
-        { parse_mode: 'Markdown' }
-      );
+      const replyToMessageId =
+        'message' in ctx && ctx.message
+          ? String(ctx.message.message_id)
+          : undefined;
+      await this.sendMessage({
+        chatId: String(ctx.chat.id),
+        text: HELP_TEXT,
+        replyToMessageId,
+      });
     });
     
     // Handle /status
     this.bot.command('status', async (ctx) => {
       if (this.onCommand) {
         const result = await this.onCommand('status', String(ctx.chat.id));
-        await ctx.reply(result || 'No status available');
+        const replyToMessageId =
+          'message' in ctx && ctx.message
+            ? String(ctx.message.message_id)
+            : undefined;
+        await this.sendMessage({
+          chatId: String(ctx.chat.id),
+          text: result || 'No status available',
+          replyToMessageId,
+        });
       }
     });
     
@@ -248,14 +289,32 @@ export class TelegramAdapter implements ChannelAdapter {
     this.bot.command('reset', async (ctx) => {
       if (this.onCommand) {
         const result = await this.onCommand('reset', String(ctx.chat.id));
-        await ctx.reply(result || 'Reset complete');
+        const replyToMessageId =
+          'message' in ctx && ctx.message
+            ? String(ctx.message.message_id)
+            : undefined;
+        await this.sendMessage({
+          chatId: String(ctx.chat.id),
+          text: result || 'Reset complete',
+          replyToMessageId,
+        });
       }
     });
 
     this.bot.command('cancel', async (ctx) => {
       if (this.onCommand) {
         const result = await this.onCommand('cancel', String(ctx.chat.id));
-        if (result) await ctx.reply(result);
+        if (result) {
+          const replyToMessageId =
+            'message' in ctx && ctx.message
+              ? String(ctx.message.message_id)
+              : undefined;
+          await this.sendMessage({
+            chatId: String(ctx.chat.id),
+            text: result,
+            replyToMessageId,
+          });
+        }
       }
     });
 
@@ -264,7 +323,15 @@ export class TelegramAdapter implements ChannelAdapter {
       if (this.onCommand) {
         const args = ctx.match?.trim() || undefined;
         const result = await this.onCommand('model', String(ctx.chat.id), args);
-        await ctx.reply(result || 'No model info available');
+        const replyToMessageId =
+          'message' in ctx && ctx.message
+            ? String(ctx.message.message_id)
+            : undefined;
+        await this.sendMessage({
+          chatId: String(ctx.chat.id),
+          text: result || 'No model info available',
+          replyToMessageId,
+        });
       }
     });
 
@@ -273,7 +340,15 @@ export class TelegramAdapter implements ChannelAdapter {
       if (this.onCommand) {
         const args = ctx.match?.trim() || undefined;
         const result = await this.onCommand('setconv', String(ctx.chat.id), args);
-        await ctx.reply(result || 'Failed to set conversation');
+        const replyToMessageId =
+          'message' in ctx && ctx.message
+            ? String(ctx.message.message_id)
+            : undefined;
+        await this.sendMessage({
+          chatId: String(ctx.chat.id),
+          text: result || 'Failed to set conversation',
+          replyToMessageId,
+        });
       }
     });
     
@@ -284,7 +359,18 @@ export class TelegramAdapter implements ChannelAdapter {
       const text = ctx.message.text;
 
       if (!userId) return;
-      if (text.startsWith('/')) return;  // Skip other commands
+      if (text.startsWith('/')) {
+        const commandToken = text.slice(1).trim().split(/\s+/)[0] || '';
+        const commandName = commandToken.toLowerCase().split('@')[0];
+        if (!KNOWN_TELEGRAM_COMMANDS.has(commandName)) {
+          await this.sendMessage({
+            chatId: String(chatId),
+            text: `Unknown command: /${commandName || '(empty)'}\nTry /help.`,
+            replyToMessageId: String(ctx.message.message_id),
+          });
+        }
+        return;
+      }
 
       // Group gating (runs AFTER pairing middleware)
       const gating = this.applyGroupGating(ctx);
@@ -593,13 +679,21 @@ export class TelegramAdapter implements ChannelAdapter {
         const result = await this.bot.api.sendVoice(file.chatId, input, { caption });
         return { messageId: String(result.message_id) };
       } catch (err: any) {
-        // Fall back to sendAudio if voice messages are restricted (Telegram Premium privacy setting)
-        if (err?.description?.includes('VOICE_MESSAGES_FORBIDDEN')) {
-          log.warn('sendVoice forbidden, falling back to sendAudio');
+        const reason = getTelegramErrorReason(err);
+        // Only retry with sendAudio for deterministic voice-policy rejections.
+        // For network/timeout errors we rethrow to avoid possible duplicate sends.
+        if (!shouldFallbackToAudio(err)) {
+          throw err;
+        }
+        log.warn('sendVoice failed with VOICE_MESSAGES_FORBIDDEN, falling back to sendAudio:', reason);
+        try {
           const result = await this.bot.api.sendAudio(file.chatId, new InputFile(file.filePath), { caption });
           return { messageId: String(result.message_id) };
+        } catch (fallbackErr: any) {
+          const fallbackReason = getTelegramErrorReason(fallbackErr);
+          log.error('sendAudio fallback also failed:', fallbackReason);
+          throw fallbackErr;
         }
-        throw err;
       }
     }
 

@@ -34,6 +34,10 @@ For local installs, either:
 - Create `~/.lettabot/config.yaml` for global config, or
 - Set `export LETTABOT_CONFIG=/path/to/your/config.yaml`
 
+### Interactive Editor
+
+Run `lettabot config tui` for an interactive editor that covers server auth, agent identity, channels, and features. See [CLI Tools](./cli-tools.md#lettabot-config) for details.
+
 ## Example Configuration
 
 ```yaml
@@ -88,6 +92,7 @@ channels:
   signal:
     enabled: true
     phone: "+1234567890"
+    readReceipts: true
     selfChat: true
     dmPolicy: pairing
 
@@ -235,6 +240,7 @@ agents:
     channels:
       signal:
         phone: "+1234567890"
+        readReceipts: true
         selfChat: true
       whatsapp:
         enabled: true
@@ -440,6 +446,29 @@ Resolution follows the same priority as `mode`: specific channel/group ID > guil
 
 This works across all channels (Discord, Telegram, Slack, Signal, WhatsApp).
 
+### Discord Thread Controls
+
+Discord supports extra per-group controls for thread-first workflows:
+
+- `groups.<id>.threadMode: thread-only` -- bot responds only to messages in threads
+- `groups.<id>.autoCreateThreadOnMention: true` -- for top-level @mentions, create a thread and reply there
+
+Example (`#ezra` style):
+
+```yaml
+channels:
+  discord:
+    groups:
+      "EZRA_CHANNEL_ID":
+        mode: open
+        threadMode: thread-only
+        autoCreateThreadOnMention: true
+```
+
+Thread messages inherit parent channel config, so child threads under `EZRA_CHANNEL_ID` use the same group rules.
+
+When `threadMode: thread-only` is set, each thread automatically gets its own isolated conversation (message history). This overrides `shared` and `per-channel` conversation modes so that messages from different threads are never interleaved. Agent memory (blocks) is still shared across all threads. (In `disabled` mode, all messages use the agent's built-in default conversation and thread isolation does not apply.)
+
 ### Finding Group IDs
 
 Each channel uses different identifiers for groups:
@@ -494,6 +523,7 @@ For dedicated bot numbers (`selfChat: false`), onboarding defaults to **allowlis
 | Option | Type | Description |
 |--------|------|-------------|
 | `phone` | string | Phone number with + prefix |
+| `readReceipts` | boolean | Send read receipts for incoming messages (default: `true`) |
 | `selfChat` | boolean | `true` = only "Note to Self" works |
 
 ## Features Configuration
@@ -505,12 +535,20 @@ features:
   heartbeat:
     enabled: true
     intervalMin: 60    # Check every 60 minutes
-    skipRecentUserMin: 5  # Skip auto-heartbeats for N minutes after user message (0 disables)
+    skipRecentPolicy: fraction      # fixed | fraction | off
+    skipRecentFraction: 0.5         # Used when policy=fraction (0-1)
+    # skipRecentUserMin: 5          # Used when policy=fixed (0 disables)
+    interruptOnUserMessage: true    # Cancel in-flight heartbeat when user messages arrive
 ```
 
 Heartbeats are background tasks where the agent can review pending work.
-If the user messaged recently, automatic heartbeats are skipped by default for 5 minutes (`skipRecentUserMin`).
-Set this to `0` to disable skipping. Manual `/heartbeat` bypasses the skip check.
+By default, automatic heartbeats skip for half of the heartbeat interval (`skipRecentPolicy: fraction` with `skipRecentFraction: 0.5`).
+- `fixed`: use `skipRecentUserMin`.
+- `fraction`: use `ceil(intervalMin * skipRecentFraction)`.
+- `off`: disable recent-user skipping.
+
+`interruptOnUserMessage` defaults to `true`, so live user messages cancel in-flight heartbeat runs on the same conversation key.
+Manual `/heartbeat` bypasses the recent-user skip check.
 
 #### Custom Heartbeat Prompt
 
@@ -541,13 +579,19 @@ Via environment variable:
 ```bash
 HEARTBEAT_PROMPT="Review recent conversations" npm start
 # Optional: HEARTBEAT_SKIP_RECENT_USER_MIN=0 to disable recent-user skip
+# Optional: HEARTBEAT_SKIP_RECENT_POLICY=fixed|fraction|off
+# Optional: HEARTBEAT_SKIP_RECENT_FRACTION=0.5
+# Optional: HEARTBEAT_INTERRUPT_ON_USER_MESSAGE=true
 ```
 
 Precedence: `prompt` (inline YAML) > `HEARTBEAT_PROMPT` (env var) > `promptFile` (file) > built-in default.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `features.heartbeat.skipRecentUserMin` | number | `5` | Skip auto-heartbeats for N minutes after a user message. Set `0` to disable. |
+| `features.heartbeat.skipRecentPolicy` | `'fixed' \| 'fraction' \| 'off'` | `'fraction'` | How recent-user skipping is calculated. |
+| `features.heartbeat.skipRecentFraction` | number | `0.5` | Fraction of `intervalMin` used when policy is `fraction` (range: `0`-`1`). |
+| `features.heartbeat.skipRecentUserMin` | number | `5` | Skip auto-heartbeats for N minutes when policy is `fixed`. Set `0` to disable fixed-window skipping. |
+| `features.heartbeat.interruptOnUserMessage` | boolean | `true` | Cancel in-flight heartbeat runs when a user message arrives on the same conversation key. |
 | `features.heartbeat.prompt` | string | _(none)_ | Custom heartbeat prompt text |
 | `features.heartbeat.promptFile` | string | _(none)_ | Path to prompt file (relative to working dir) |
 
@@ -565,6 +609,48 @@ Only files inside this directory (and its subdirectories) can be sent. Paths tha
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `features.sendFileDir` | string | _(workingDir)_ | Directory that `<send-file>` paths must be inside |
+
+### Sleeptime (Background Reflection)
+
+Sleeptime lets the agent reflect on recent interactions in the background, updating its memory without being prompted. It requires [memory filesystem](#memory-filesystem-memfs) (`memfs: true`) to be enabled -- if memfs is off, sleeptime is silently ignored with a startup warning.
+
+```yaml
+features:
+  memfs: true
+  sleeptime:
+    trigger: step-count       # "off" | "step-count" | "compaction-event"
+    behavior: reminder        # "reminder" | "auto-launch"
+    stepCount: 10             # Steps between reflections (step-count trigger only)
+```
+
+**Triggers:**
+
+| Trigger | Description |
+|---------|-------------|
+| `off` | Disable sleeptime (explicit opt-out) |
+| `step-count` | Reflect every N steps (configured via `stepCount`) |
+| `compaction-event` | Reflect when the context window is compacted |
+
+**Behaviors:**
+
+| Behavior | Description |
+|----------|-------------|
+| `reminder` | Agent is reminded to reflect but can choose to skip |
+| `auto-launch` | Reflection is launched automatically |
+
+Via environment variables (only used when `features.sleeptime` is not set in YAML):
+
+```bash
+SLEEPTIME_TRIGGER=step-count
+SLEEPTIME_BEHAVIOR=reminder
+SLEEPTIME_STEP_COUNT=10
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `features.sleeptime.trigger` | `'off'` \| `'step-count'` \| `'compaction-event'` | _(none)_ | When to trigger background reflection |
+| `features.sleeptime.behavior` | `'reminder'` \| `'auto-launch'` | _(none)_ | How reflection is initiated |
+| `features.sleeptime.stepCount` | number | _(none)_ | Steps between reflections (only used with `step-count` trigger) |
 
 ### Cron Jobs
 
@@ -983,6 +1069,7 @@ Reference:
 | `WHATSAPP_ENABLED` | `channels.whatsapp.enabled` |
 | `WHATSAPP_SELF_CHAT_MODE` | `channels.whatsapp.selfChat` |
 | `SIGNAL_PHONE_NUMBER` | `channels.signal.phone` |
+| `SIGNAL_READ_RECEIPTS` | `channels.signal.readReceipts` |
 | `OPENAI_API_KEY` | `transcription.apiKey` |
 | `GMAIL_ACCOUNT` | `polling.gmail.account` (comma-separated list allowed) |
 | `POLLING_INTERVAL_MS` | `polling.intervalMs` |
@@ -992,6 +1079,9 @@ Reference:
 | `ALLOWED_TOOLS` | `features.allowedTools` (comma-separated list) |
 | `DISALLOWED_TOOLS` | `features.disallowedTools` (comma-separated list) |
 | `LETTABOT_WORKING_DIR` | Agent working directory (overridden by per-agent `workingDir`) |
+| `SLEEPTIME_TRIGGER` | `features.sleeptime.trigger` (off/step-count/compaction-event) |
+| `SLEEPTIME_BEHAVIOR` | `features.sleeptime.behavior` (reminder/auto-launch) |
+| `SLEEPTIME_STEP_COUNT` | `features.sleeptime.stepCount` |
 | `TTS_PROVIDER` | TTS backend: `elevenlabs` (default) or `openai` |
 | `ELEVENLABS_API_KEY` | API key for ElevenLabs TTS |
 | `ELEVENLABS_VOICE_ID` | ElevenLabs voice ID (default: `onwK4e9ZLuTAKqWW03F9`) |

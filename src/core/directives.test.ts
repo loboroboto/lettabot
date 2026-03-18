@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { parseDirectives, stripActionsBlock } from './directives.js';
+import {
+  hasIncompleteActionsTag,
+  hasUnclosedActionsBlock,
+  parseDirectives,
+  stripActionsBlock,
+} from './directives.js';
 
 describe('parseDirectives', () => {
   it('returns text unchanged when no actions block present', () => {
@@ -113,11 +118,34 @@ describe('parseDirectives', () => {
     expect(result.directives).toEqual([]);
   });
 
-  it('ignores actions block NOT at start of response', () => {
+  it('parses actions block in middle of response', () => {
     const input = 'Some text first <actions><react emoji="eyes" /></actions>';
     const result = parseDirectives(input);
-    expect(result.cleanText).toBe(input);
-    expect(result.directives).toEqual([]);
+    expect(result.cleanText).toBe('Some text first');
+    expect(result.directives).toEqual([{ type: 'react', emoji: 'eyes' }]);
+  });
+
+  it('parses trailing actions block after visible text', () => {
+    const input = 'Message complete. <actions><react emoji="thumbsup" /></actions>';
+    const result = parseDirectives(input);
+    expect(result.cleanText).toBe('Message complete.');
+    expect(result.directives).toEqual([{ type: 'react', emoji: 'thumbsup' }]);
+  });
+
+  it('parses and executes directives across multiple actions blocks in source order', () => {
+    const input = [
+      'Start',
+      '<actions><react emoji="eyes" /></actions>',
+      'Middle',
+      '<actions><voice>Hello</voice></actions>',
+      'End',
+    ].join(' ');
+    const result = parseDirectives(input);
+    expect(result.cleanText).toBe('Start  Middle  End');
+    expect(result.directives).toEqual([
+      { type: 'react', emoji: 'eyes' },
+      { type: 'voice', text: 'Hello' },
+    ]);
   });
 
   it('handles leading whitespace before actions block', () => {
@@ -208,6 +236,122 @@ describe('parseDirectives', () => {
       { type: 'voice', text: 'Two' },
     ]);
   });
+
+  // --- send-message directive ---
+
+  it('parses send-message directive with channel and chat', () => {
+    const result = parseDirectives(
+      '<actions><send-message channel="whatsapp" chat="5511999999999">Your transcription is ready</send-message></actions>',
+    );
+    expect(result.cleanText).toBe('');
+    expect(result.directives).toEqual([
+      { type: 'send-message', text: 'Your transcription is ready', channel: 'whatsapp', chat: '5511999999999' },
+    ]);
+  });
+
+  it('parses send-message with text after actions block', () => {
+    const result = parseDirectives(
+      '<actions><send-message channel="telegram" chat="123">Done!</send-message></actions>\nHere is the summary.',
+    );
+    expect(result.cleanText).toBe('Here is the summary.');
+    expect(result.directives).toEqual([
+      { type: 'send-message', text: 'Done!', channel: 'telegram', chat: '123' },
+    ]);
+  });
+
+  it('parses send-message with multiline text', () => {
+    const result = parseDirectives(
+      '<actions><send-message channel="slack" chat="C123">Line one.\nLine two.</send-message></actions>',
+    );
+    expect(result.directives).toEqual([
+      { type: 'send-message', text: 'Line one.\nLine two.', channel: 'slack', chat: 'C123' },
+    ]);
+  });
+
+  it('ignores send-message without channel attribute', () => {
+    const result = parseDirectives(
+      '<actions><send-message chat="123">Hello</send-message></actions>',
+    );
+    expect(result.directives).toEqual([]);
+  });
+
+  it('ignores send-message without chat attribute', () => {
+    const result = parseDirectives(
+      '<actions><send-message channel="telegram">Hello</send-message></actions>',
+    );
+    expect(result.directives).toEqual([]);
+  });
+
+  it('ignores send-message with empty text', () => {
+    const result = parseDirectives(
+      '<actions><send-message channel="telegram" chat="123">   </send-message></actions>',
+    );
+    expect(result.directives).toEqual([]);
+  });
+
+  it('parses multiple send-message directives', () => {
+    const result = parseDirectives(
+      '<actions>' +
+      '<send-message channel="whatsapp" chat="111">Hello user 1</send-message>' +
+      '<send-message channel="telegram" chat="222">Hello user 2</send-message>' +
+      '</actions>',
+    );
+    expect(result.directives).toHaveLength(2);
+    expect(result.directives[0]).toEqual({ type: 'send-message', text: 'Hello user 1', channel: 'whatsapp', chat: '111' });
+    expect(result.directives[1]).toEqual({ type: 'send-message', text: 'Hello user 2', channel: 'telegram', chat: '222' });
+  });
+
+  it('parses send-message mixed with other directives', () => {
+    const result = parseDirectives(
+      '<actions>' +
+      '<react emoji="thumbsup" />' +
+      '<send-message channel="whatsapp" chat="555">Result ready</send-message>' +
+      '<send-file path="report.pdf" />' +
+      '</actions>',
+    );
+    expect(result.directives).toHaveLength(3);
+    expect(result.directives[0]).toEqual({ type: 'react', emoji: 'thumbsup' });
+    expect(result.directives[1]).toEqual({ type: 'send-message', text: 'Result ready', channel: 'whatsapp', chat: '555' });
+    expect(result.directives[2]).toEqual({ type: 'send-file', path: 'report.pdf' });
+  });
+
+  // --- send-file with channel/chat targeting ---
+
+  it('parses send-file with channel and chat targeting', () => {
+    const result = parseDirectives(
+      '<actions><send-file path="result.txt" channel="whatsapp" chat="5511999999999" caption="Here you go" /></actions>',
+    );
+    expect(result.directives).toEqual([
+      { type: 'send-file', path: 'result.txt', channel: 'whatsapp', chat: '5511999999999', caption: 'Here you go' },
+    ]);
+  });
+
+  it('parses send-file without channel/chat (default behavior unchanged)', () => {
+    const result = parseDirectives(
+      '<actions><send-file path="report.pdf" caption="Report" /></actions>',
+    );
+    expect(result.directives).toEqual([
+      { type: 'send-file', path: 'report.pdf', caption: 'Report' },
+    ]);
+  });
+
+  it('parses send-file with only channel (no chat) -- stores partial targeting', () => {
+    const result = parseDirectives(
+      '<actions><send-file path="report.pdf" channel="whatsapp" /></actions>',
+    );
+    expect(result.directives).toEqual([
+      { type: 'send-file', path: 'report.pdf', channel: 'whatsapp' },
+    ]);
+  });
+
+  it('parses send-file with only chat (no channel) -- stores partial targeting', () => {
+    const result = parseDirectives(
+      '<actions><send-file path="report.pdf" chat="123" /></actions>',
+    );
+    expect(result.directives).toEqual([
+      { type: 'send-file', path: 'report.pdf', chat: '123' },
+    ]);
+  });
 });
 
 describe('stripActionsBlock', () => {
@@ -223,8 +367,37 @@ describe('stripActionsBlock', () => {
     expect(stripActionsBlock('<actions><react emoji="eyes" /></actions>')).toBe('');
   });
 
-  it('does not strip actions block in middle of text', () => {
+  it('strips actions block in middle of text', () => {
     const input = 'Before <actions><react emoji="eyes" /></actions> After';
-    expect(stripActionsBlock(input)).toBe(input);
+    expect(stripActionsBlock(input)).toBe('Before  After');
+  });
+
+  it('strips multiple actions blocks in one response', () => {
+    const input = 'A <actions><react emoji="eyes" /></actions> B <actions><voice>Hello</voice></actions> C';
+    expect(stripActionsBlock(input)).toBe('A  B  C');
+  });
+});
+
+describe('hasUnclosedActionsBlock', () => {
+  it('detects unmatched opening actions tag', () => {
+    expect(hasUnclosedActionsBlock('Before <actions><react emoji="eyes" />')).toBe(true);
+  });
+
+  it('returns false for complete actions block', () => {
+    expect(hasUnclosedActionsBlock('Before <actions><react emoji="eyes" /></actions> After')).toBe(false);
+  });
+});
+
+describe('hasIncompleteActionsTag', () => {
+  it('detects partial opening actions tag while streaming', () => {
+    expect(hasIncompleteActionsTag('Before <act')).toBe(true);
+  });
+
+  it('detects partial closing actions tag while streaming', () => {
+    expect(hasIncompleteActionsTag('Before </act')).toBe(true);
+  });
+
+  it('returns false when no partial actions tag is present', () => {
+    expect(hasIncompleteActionsTag('Before <code>ok</code>')).toBe(false);
   });
 });

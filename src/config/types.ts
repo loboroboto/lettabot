@@ -11,6 +11,7 @@ import { createLogger } from '../logger.js';
 const log = createLogger('Config');
 export type ServerMode = 'api' | 'docker' | 'cloud' | 'selfhosted';
 export type CanonicalServerMode = 'api' | 'docker';
+export type HeartbeatSkipRecentPolicy = 'fixed' | 'fraction' | 'off';
 
 export function canonicalizeServerMode(mode?: ServerMode): CanonicalServerMode {
   return mode === 'docker' || mode === 'selfhosted' ? 'docker' : 'api';
@@ -40,6 +41,15 @@ export interface DisplayConfig {
   reasoningMaxChars?: number;
 }
 
+export type SleeptimeTrigger = 'off' | 'step-count' | 'compaction-event';
+export type SleeptimeBehavior = 'reminder' | 'auto-launch';
+
+export interface SleeptimeConfig {
+  trigger?: SleeptimeTrigger;
+  behavior?: SleeptimeBehavior;
+  stepCount?: number;
+}
+
 /**
  * Configuration for a single agent in multi-agent mode.
  * Each agent has its own name, channels, and features.
@@ -63,6 +73,7 @@ export interface AgentConfig {
     whatsapp?: WhatsAppConfig;
     signal?: SignalConfig;
     discord?: DiscordConfig;
+    bluesky?: BlueskyConfig;
   };
   /** Conversation routing */
   conversations?: {
@@ -79,11 +90,15 @@ export interface AgentConfig {
       enabled: boolean;
       intervalMin?: number;
       skipRecentUserMin?: number; // Skip auto-heartbeats for N minutes after user message (0 disables)
+      skipRecentPolicy?: HeartbeatSkipRecentPolicy; // 'fixed' | 'fraction' | 'off'
+      skipRecentFraction?: number; // Fraction of intervalMin when policy=fraction (0-1)
+      interruptOnUserMessage?: boolean; // Cancel in-flight heartbeat when user messages arrive
       prompt?: string;       // Custom heartbeat prompt (replaces default body)
       promptFile?: string;   // Path to prompt file (re-read each tick for live editing)
       target?: string;       // Delivery target ("telegram:123", "slack:C123", etc.)
     };
     memfs?: boolean;          // Enable memory filesystem (git-backed context repository) for SDK sessions
+    sleeptime?: SleeptimeConfig; // Configure SDK reflection reminders (/sleeptime equivalent)
     maxToolCalls?: number;
     sendFileDir?: string;    // Restrict <send-file> directive to this directory (default: data/outbound)
     sendFileMaxSize?: number; // Max file size in bytes for <send-file> (default: 50MB)
@@ -91,6 +106,10 @@ export interface AgentConfig {
     display?: DisplayConfig;
     allowedTools?: string[];       // Per-agent tool whitelist (overrides global/env ALLOWED_TOOLS)
     disallowedTools?: string[];    // Per-agent tool blocklist (overrides global/env DISALLOWED_TOOLS)
+    logging?: {
+      turnLogFile?: string;        // Path to JSONL file for turn logging (one record per agent turn)
+      maxTurns?: number;           // Max turns to retain in the log file (default: 1000, oldest trimmed)
+    };
   };
   /** Security settings */
   security?: {
@@ -151,6 +170,7 @@ export interface LettaBotConfig {
     whatsapp?: WhatsAppConfig;
     signal?: SignalConfig;
     discord?: DiscordConfig;
+    bluesky?: BlueskyConfig;
   };
 
   // Conversation routing
@@ -169,12 +189,16 @@ export interface LettaBotConfig {
       enabled: boolean;
       intervalMin?: number;
       skipRecentUserMin?: number; // Skip auto-heartbeats for N minutes after user message (0 disables)
+      skipRecentPolicy?: HeartbeatSkipRecentPolicy; // 'fixed' | 'fraction' | 'off'
+      skipRecentFraction?: number; // Fraction of intervalMin when policy=fraction (0-1)
+      interruptOnUserMessage?: boolean; // Cancel in-flight heartbeat when user messages arrive
       prompt?: string;       // Custom heartbeat prompt (replaces default body)
       promptFile?: string;   // Path to prompt file (re-read each tick for live editing)
       target?: string;       // Delivery target ("telegram:123", "slack:C123", etc.)
     };
     inlineImages?: boolean;   // Send images directly to the LLM (default: true). Set false to only send file paths.
     memfs?: boolean;          // Enable memory filesystem (git-backed context repository) for SDK sessions
+    sleeptime?: SleeptimeConfig; // Configure SDK reflection reminders (/sleeptime equivalent)
     maxToolCalls?: number;  // Abort if agent calls this many tools in one turn (default: 100)
     sendFileDir?: string;   // Restrict <send-file> directive to this directory (default: data/outbound)
     sendFileMaxSize?: number; // Max file size in bytes for <send-file> (default: 50MB)
@@ -182,6 +206,10 @@ export interface LettaBotConfig {
     display?: DisplayConfig;  // Show tool calls / reasoning in channel output
     allowedTools?: string[];       // Global tool whitelist (overridden by per-agent, falls back to ALLOWED_TOOLS env)
     disallowedTools?: string[];    // Global tool blocklist (overridden by per-agent, falls back to DISALLOWED_TOOLS env)
+    logging?: {
+      turnLogFile?: string;        // Global turn log file (overridden by per-agent)
+      maxTurns?: number;           // Global maxTurns default (overridden by per-agent)
+    };
   };
 
   // Polling - system-level background checks (Gmail, etc.)
@@ -281,6 +309,10 @@ export interface GroupConfig {
   dailyLimit?: number;
   /** Maximum bot triggers per user per day in this group. Omit for unlimited. */
   dailyUserLimit?: number;
+  /** Discord only: require messages to be in a thread before the bot responds. */
+  threadMode?: 'any' | 'thread-only';
+  /** Discord only: when true, @mentions in parent channels auto-create a thread. */
+  autoCreateThreadOnMention?: boolean;
   /**
    * @deprecated Use mode: "mention-only" (true) or "open" (false).
    */
@@ -349,6 +381,7 @@ export interface SignalConfig {
   cliPath?: string;     // Path to signal-cli binary (default: "signal-cli")
   httpHost?: string;    // Daemon HTTP host (default: "127.0.0.1")
   httpPort?: number;    // Daemon HTTP port (default: 8090)
+  readReceipts?: boolean; // Send read receipts for incoming messages (default: true)
   selfChat?: boolean;
   dmPolicy?: 'pairing' | 'allowlist' | 'open';
   allowedUsers?: string[];
@@ -373,6 +406,30 @@ export interface DiscordConfig {
   listeningGroups?: string[];     // @deprecated Use groups.<id>.mode = "listen"
   groups?: Record<string, GroupConfig>;  // Per-guild/channel settings, "*" for defaults
   ignoreBotReactions?: boolean;   // Ignore all bot reactions (default: true). Set false for multi-bot setups.
+}
+
+export interface BlueskyConfig {
+  enabled: boolean;
+  jetstreamUrl?: string;
+  wantedDids?: string[];         // DID(s) to follow (e.g., did:plc:...)
+  wantedCollections?: string[];  // Optional collection filters (e.g., app.bsky.feed.post)
+  cursor?: number;               // Jetstream cursor (microseconds)
+  handle?: string;               // Bluesky handle (for posting)
+  appPassword?: string;          // App password (for posting)
+  serviceUrl?: string;           // ATProto service URL (default: https://bsky.social)
+  appViewUrl?: string;           // AppView URL for list/notification APIs
+  groups?: Record<string, GroupConfig>; // Use "*" for defaults, DID for overrides
+  notifications?: BlueskyNotificationsConfig;
+  lists?: Record<string, GroupConfig>;  // List URI -> mode
+}
+
+export interface BlueskyNotificationsConfig {
+  enabled?: boolean;        // Poll notifications API (requires auth)
+  intervalSec?: number;     // Poll interval (default: 60s)
+  limit?: number;           // Max notifications per request (default: 50)
+  priority?: boolean;       // Priority only
+  reasons?: string[];       // Filter reasons (e.g., ['mention','reply'])
+  backfill?: boolean;       // Process unread notifications on startup (default: false)
 }
 
 /**
@@ -518,6 +575,9 @@ export function normalizeAgents(config: LettaBotConfig): AgentConfig[] {
     const normalized: AgentConfig['channels'] = {};
     if (!channels) return normalized;
 
+    const hasValidMtprotoApiId = (value: unknown): value is number =>
+      typeof value === 'number' && Number.isInteger(value) && value > 0;
+
     // Merge env vars into YAML blocks that are missing their key credential.
     // Without this, `signal: enabled: true` + SIGNAL_PHONE_NUMBER env var
     // silently fails because the env-var-only fallback (below) only fires
@@ -535,14 +595,32 @@ export function normalizeAgents(config: LettaBotConfig): AgentConfig[] {
     if (channels.discord && !channels.discord.token && process.env.DISCORD_BOT_TOKEN) {
       channels.discord.token = process.env.DISCORD_BOT_TOKEN;
     }
+    if (channels['telegram-mtproto']) {
+      if (channels['telegram-mtproto'].apiId === undefined && process.env.TELEGRAM_API_ID) {
+        const parsedApiId = parseInt(process.env.TELEGRAM_API_ID, 10);
+        if (hasValidMtprotoApiId(parsedApiId)) {
+          channels['telegram-mtproto'].apiId = parsedApiId;
+        }
+      }
+      if (!channels['telegram-mtproto'].apiHash && process.env.TELEGRAM_API_HASH) {
+        channels['telegram-mtproto'].apiHash = process.env.TELEGRAM_API_HASH;
+      }
+      if (!channels['telegram-mtproto'].phoneNumber && process.env.TELEGRAM_PHONE_NUMBER) {
+        channels['telegram-mtproto'].phoneNumber = process.env.TELEGRAM_PHONE_NUMBER;
+      }
+    }
 
     if (channels.telegram?.enabled !== false && channels.telegram?.token) {
       const telegram = { ...channels.telegram };
       normalizeLegacyGroupFields(telegram, `${sourcePath}.telegram`);
       normalized.telegram = telegram;
     }
-    // telegram-mtproto: check apiId as the key credential
-    if (channels['telegram-mtproto']?.enabled !== false && channels['telegram-mtproto']?.apiId) {
+    if (
+      channels['telegram-mtproto']?.enabled !== false
+      && hasValidMtprotoApiId(channels['telegram-mtproto']?.apiId)
+      && !!channels['telegram-mtproto']?.apiHash
+      && !!channels['telegram-mtproto']?.phoneNumber
+    ) {
       normalized['telegram-mtproto'] = channels['telegram-mtproto'];
     }
     if (channels.slack?.enabled !== false && channels.slack?.botToken && channels.slack?.appToken) {
@@ -566,18 +644,34 @@ export function normalizeAgents(config: LettaBotConfig): AgentConfig[] {
       normalizeLegacyGroupFields(discord, `${sourcePath}.discord`);
       normalized.discord = discord;
     }
-
-    // Warn when a channel block exists but was dropped due to missing credentials
-    const channelCredentials: Array<[string, unknown, boolean]> = [
-      ['telegram', channels.telegram, !!normalized.telegram],
-      ['slack', channels.slack, !!normalized.slack],
-      ['signal', channels.signal, !!normalized.signal],
-      ['discord', channels.discord, !!normalized.discord],
-    ];
-    for (const [name, raw, included] of channelCredentials) {
-      if (raw && (raw as Record<string, unknown>).enabled !== false && !included) {
-        log.warn(`Channel '${name}' is in ${sourcePath} but missing required credentials -- skipping. Check your lettabot.yaml or environment variables.`);
+    if (channels.bluesky && channels.bluesky.enabled !== false) {
+      const bluesky = { ...channels.bluesky, enabled: channels.bluesky.enabled ?? true };
+      const wantsDids = Array.isArray(bluesky.wantedDids) && bluesky.wantedDids.length > 0;
+      const canReply = !!(bluesky.handle && bluesky.appPassword);
+      const hasLists = !!(bluesky.lists && Object.keys(bluesky.lists).length > 0);
+      const wantsNotifications = !!bluesky.notifications?.enabled;
+      if (wantsDids || canReply || hasLists || wantsNotifications) {
+        normalized.bluesky = bluesky;
       }
+    }
+
+    const channelCredentials: Array<{ name: string; raw: unknown; included: boolean; required: string }> = [
+      { name: 'telegram', raw: channels.telegram, included: !!normalized.telegram, required: 'token' },
+      { name: 'telegram-mtproto', raw: channels['telegram-mtproto'], included: !!normalized['telegram-mtproto'], required: 'apiId, apiHash, phoneNumber' },
+      { name: 'slack', raw: channels.slack, included: !!normalized.slack, required: 'botToken, appToken' },
+      { name: 'signal', raw: channels.signal, included: !!normalized.signal, required: 'phone' },
+      { name: 'discord', raw: channels.discord, included: !!normalized.discord, required: 'token' },
+    ];
+
+    const invalidChannels = channelCredentials
+      .filter(({ raw, included }) => !!raw && (raw as Record<string, unknown>).enabled !== false && !included)
+      .map(({ name, required }) => `- ${sourcePath}.${name}: missing required field(s): ${required}`);
+
+    if (invalidChannels.length > 0) {
+      throw new Error(
+        `Invalid channel configuration:\n${invalidChannels.join('\n')}\n` +
+        'Set required credentials in lettabot.yaml or environment variables, or set enabled: false.'
+      );
     }
 
     return normalized;
@@ -602,8 +696,20 @@ export function normalizeAgents(config: LettaBotConfig): AgentConfig[] {
 
   // Env var fallback for container deploys without lettabot.yaml (e.g. Railway)
   // Helper: parse comma-separated env var into string array (or undefined)
-  const parseList = (envVar?: string): string[] | undefined =>
-    envVar ? envVar.split(',').map(s => s.trim()).filter(Boolean) : undefined;
+  const parseList = (envVar?: string): string[] | undefined => {
+    if (envVar === undefined) return undefined;
+    const values = envVar.split(',').map(s => s.trim()).filter(Boolean);
+    return values.length > 0 ? values : undefined;
+  };
+
+  const parseOptionalBooleanEnv = (envVar?: string): boolean | undefined => {
+    if (envVar === undefined) return undefined;
+    const normalized = envVar.trim().toLowerCase();
+    if (!normalized) return undefined;
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
+    return undefined;
+  };
 
   if (!channels.telegram && process.env.TELEGRAM_BOT_TOKEN) {
     channels.telegram = {
@@ -639,7 +745,7 @@ export function normalizeAgents(config: LettaBotConfig): AgentConfig[] {
   if (!channels.whatsapp && process.env.WHATSAPP_ENABLED === 'true') {
     channels.whatsapp = {
       enabled: true,
-      selfChat: process.env.WHATSAPP_SELF_CHAT_MODE !== 'false',
+      selfChat: parseOptionalBooleanEnv(process.env.WHATSAPP_SELF_CHAT_MODE) ?? true,
       dmPolicy: (process.env.WHATSAPP_DM_POLICY as 'pairing' | 'allowlist' | 'open') || 'pairing',
       allowedUsers: parseList(process.env.WHATSAPP_ALLOWED_USERS),
     };
@@ -648,7 +754,8 @@ export function normalizeAgents(config: LettaBotConfig): AgentConfig[] {
     channels.signal = {
       enabled: true,
       phone: process.env.SIGNAL_PHONE_NUMBER,
-      selfChat: process.env.SIGNAL_SELF_CHAT_MODE !== 'false',
+      readReceipts: parseOptionalBooleanEnv(process.env.SIGNAL_READ_RECEIPTS) ?? true,
+      selfChat: parseOptionalBooleanEnv(process.env.SIGNAL_SELF_CHAT_MODE) ?? true,
       dmPolicy: (process.env.SIGNAL_DM_POLICY as 'pairing' | 'allowlist' | 'open') || 'pairing',
       allowedUsers: parseList(process.env.SIGNAL_ALLOWED_USERS),
     };
@@ -659,6 +766,32 @@ export function normalizeAgents(config: LettaBotConfig): AgentConfig[] {
       token: process.env.DISCORD_BOT_TOKEN,
       dmPolicy: (process.env.DISCORD_DM_POLICY as 'pairing' | 'allowlist' | 'open') || 'pairing',
       allowedUsers: parseList(process.env.DISCORD_ALLOWED_USERS),
+    };
+  }
+  if (!channels.bluesky && process.env.BLUESKY_WANTED_DIDS) {
+    channels.bluesky = {
+      enabled: true,
+      wantedDids: parseList(process.env.BLUESKY_WANTED_DIDS),
+      wantedCollections: parseList(process.env.BLUESKY_WANTED_COLLECTIONS),
+      jetstreamUrl: process.env.BLUESKY_JETSTREAM_URL,
+      cursor: process.env.BLUESKY_CURSOR ? parseInt(process.env.BLUESKY_CURSOR, 10) : undefined,
+      handle: process.env.BLUESKY_HANDLE,
+      appPassword: process.env.BLUESKY_APP_PASSWORD,
+      serviceUrl: process.env.BLUESKY_SERVICE_URL,
+      appViewUrl: process.env.BLUESKY_APPVIEW_URL,
+      notifications: process.env.BLUESKY_NOTIFICATIONS_ENABLED === 'true'
+        ? {
+            enabled: true,
+            intervalSec: process.env.BLUESKY_NOTIFICATIONS_INTERVAL_SEC
+              ? parseInt(process.env.BLUESKY_NOTIFICATIONS_INTERVAL_SEC, 10)
+              : undefined,
+            limit: process.env.BLUESKY_NOTIFICATIONS_LIMIT
+              ? parseInt(process.env.BLUESKY_NOTIFICATIONS_LIMIT, 10)
+              : undefined,
+            priority: process.env.BLUESKY_NOTIFICATIONS_PRIORITY === 'true',
+            reasons: parseList(process.env.BLUESKY_NOTIFICATIONS_REASONS),
+          }
+        : undefined,
     };
   }
 
@@ -678,11 +811,56 @@ export function normalizeAgents(config: LettaBotConfig): AgentConfig[] {
     const skipRecentUserMin = process.env.HEARTBEAT_SKIP_RECENT_USER_MIN
       ? parseInt(process.env.HEARTBEAT_SKIP_RECENT_USER_MIN, 10)
       : undefined;
+    const skipRecentPolicyRaw = process.env.HEARTBEAT_SKIP_RECENT_POLICY;
+    const skipRecentPolicy = skipRecentPolicyRaw === 'fixed'
+      || skipRecentPolicyRaw === 'fraction'
+      || skipRecentPolicyRaw === 'off'
+      ? skipRecentPolicyRaw
+      : undefined;
+    const skipRecentFraction = process.env.HEARTBEAT_SKIP_RECENT_FRACTION
+      ? Number(process.env.HEARTBEAT_SKIP_RECENT_FRACTION)
+      : undefined;
+    const interruptOnUserMessageRaw = process.env.HEARTBEAT_INTERRUPT_ON_USER_MESSAGE;
+    const interruptOnUserMessage = interruptOnUserMessageRaw === 'true'
+      ? true
+      : interruptOnUserMessageRaw === 'false'
+        ? false
+        : undefined;
 
     features.heartbeat = {
       enabled: true,
       ...(Number.isFinite(intervalMin) ? { intervalMin } : {}),
       ...(Number.isFinite(skipRecentUserMin) ? { skipRecentUserMin } : {}),
+      ...(skipRecentPolicy ? { skipRecentPolicy } : {}),
+      ...(Number.isFinite(skipRecentFraction) ? { skipRecentFraction } : {}),
+      ...(interruptOnUserMessage !== undefined ? { interruptOnUserMessage } : {}),
+    };
+  }
+
+  const sleeptimeTriggerRaw = process.env.SLEEPTIME_TRIGGER;
+  const sleeptimeBehaviorRaw = process.env.SLEEPTIME_BEHAVIOR;
+  const sleeptimeStepCountRaw = process.env.SLEEPTIME_STEP_COUNT;
+
+  const sleeptimeTrigger = sleeptimeTriggerRaw === 'off'
+    || sleeptimeTriggerRaw === 'step-count'
+    || sleeptimeTriggerRaw === 'compaction-event'
+    ? sleeptimeTriggerRaw
+    : undefined;
+  const sleeptimeBehavior = sleeptimeBehaviorRaw === 'reminder'
+    || sleeptimeBehaviorRaw === 'auto-launch'
+    ? sleeptimeBehaviorRaw
+    : undefined;
+  const sleeptimeStepCountParsed = sleeptimeStepCountRaw ? parseInt(sleeptimeStepCountRaw, 10) : undefined;
+  const sleeptimeStepCount = Number.isFinite(sleeptimeStepCountParsed)
+    && (sleeptimeStepCountParsed as number) > 0
+    ? sleeptimeStepCountParsed
+    : undefined;
+
+  if (!features.sleeptime && (sleeptimeTrigger || sleeptimeBehavior || sleeptimeStepCount)) {
+    features.sleeptime = {
+      ...(sleeptimeTrigger ? { trigger: sleeptimeTrigger } : {}),
+      ...(sleeptimeBehavior ? { behavior: sleeptimeBehavior } : {}),
+      ...(sleeptimeStepCount ? { stepCount: sleeptimeStepCount } : {}),
     };
   }
 
