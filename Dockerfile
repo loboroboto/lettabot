@@ -23,6 +23,12 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY --from=build /app/dist ./dist
+COPY .skills/ .skills/
+
+# Install travel-agent-skills for Viajero
+RUN git clone --depth 1 https://github.com/loboroboto/travel-agent-skills.git /tmp/travel-skills \
+    && cp -r /tmp/travel-skills/skills/* .skills/ \
+    && rm -rf /tmp/travel-skills
 
 ENV NODE_ENV=production
 EXPOSE 8080
